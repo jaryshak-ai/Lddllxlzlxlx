@@ -1,0 +1,744 @@
+name: Build AntiXray
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Create project files
+        run: |
+          mkdir -p AntiXray/src/main/java/antixray AntiXray/src/main/resources
+
+          cat > AntiXray/pom.xml <<'POMEOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>antixray</groupId>
+            <artifactId>AntiXray</artifactId>
+            <version>1.0.0</version>
+            <packaging>jar</packaging>
+            <properties>
+              <maven.compiler.source>17</maven.compiler.source>
+              <maven.compiler.target>17</maven.compiler.target>
+              <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+            </properties>
+            <repositories>
+              <repository>
+                <id>lanink</id>
+                <url>https://repo.lanink.cn/repository/maven-public/</url>
+              </repository>
+            </repositories>
+            <dependencies>
+              <dependency>
+                <groupId>cn.nukkit</groupId>
+                <artifactId>Nukkit</artifactId>
+                <version>MOT-SNAPSHOT</version>
+                <scope>provided</scope>
+              </dependency>
+            </dependencies>
+            <build>
+              <finalName>AntiXray</finalName>
+            </build>
+          </project>
+          POMEOF
+
+          cat > AntiXray/src/main/resources/plugin.yml <<'PLUGEOF'
+          name: AntiXray
+          main: antixray.AntiXray
+          version: 1.0.0
+          api: ["1.0.0"]
+          author: server
+          description: Anti-xray, hides ores, bases, entities and players by distance
+          commands:
+            axr:
+              description: AntiXray
+              usage: /axr <reload|info>
+              permission: antixray.admin
+          permissions:
+            antixray.admin:
+              default: op
+            antixray.bypass:
+              default: op
+            antixray.seespec:
+              default: op
+          PLUGEOF
+
+          cat > AntiXray/src/main/resources/config.yml <<'CFGEOF'
+          # Миры, где работает анти-иксрей (пусто = все миры)
+          worlds: []
+
+          # Как часто плагин обновляет картинку у игрока (в тиках, 20 = 1 секунда)
+          interval-ticks: 10
+          # Сколько новых чанков сканировать за один проход
+          chunks-per-cycle: 6
+          # Сколько пакетов блоков максимум отправить одному игроку за проход
+          packets-per-cycle: 600
+          # Пауза после отправки чанка клиенту, потом подменяем блоки (в тиках)
+          send-delay-ticks: 20
+          # Радиус сканирования в чанках (не больше дальности прорисовки сервера)
+          scan-chunks: 8
+          # Постройки глубже этого от поверхности считаются подземными (камень вместо воздуха)
+          underground-depth: 8
+
+          # Радиусы в блоках: дальше этого расстояния игрок не видит объект
+          radius:
+            ore: 15
+            obsidian: 15
+            base: 20
+            container: 20
+            items: 20
+            mobs: 20
+            projectiles: 20
+            players: 50
+
+          # Названия блоков (как их называет сервер). Руды подменяются камнем,
+          # в аду незеркамнем, в энде эндерняком
+          obsidian-names: ["Obsidian"]
+          ore-keywords: ["Ore", "Ancient Debris"]
+          # Контейнеры и блоки баз: подменяются соседним твёрдым блоком
+          container-keywords: ["Chest", "Barrel", "Shulker", "Furnace", "Smoker", "Dispenser", "Dropper", "Hopper", "Brewing", "Enchanting", "Anvil", "Beacon", "Cauldron", "Bookshelf"]
+          # Стены, пол, крыша и т.п.: над землёй воздух, под землёй камень
+          base-keywords: ["Planks", "Brick", "Glass", "Stairs", "Slab", "Wool", "Concrete", "Fence", "Door", "Ladder"]
+          CFGEOF
+
+          cat > AntiXray/src/main/java/antixray/AntiXray.java <<'JAVAEOF'
+          package antixray;
+
+          import cn.nukkit.Player;
+          import cn.nukkit.block.Block;
+          import cn.nukkit.command.Command;
+          import cn.nukkit.command.CommandSender;
+          import cn.nukkit.entity.Entity;
+          import cn.nukkit.entity.EntityLiving;
+          import cn.nukkit.entity.item.EntityItem;
+          import cn.nukkit.entity.item.EntityXPOrb;
+          import cn.nukkit.entity.projectile.EntityProjectile;
+          import cn.nukkit.event.EventHandler;
+          import cn.nukkit.event.EventPriority;
+          import cn.nukkit.event.Listener;
+          import cn.nukkit.event.block.BlockBreakEvent;
+          import cn.nukkit.event.block.BlockPlaceEvent;
+          import cn.nukkit.event.level.ChunkUnloadEvent;
+          import cn.nukkit.event.player.PlayerQuitEvent;
+          import cn.nukkit.event.server.DataPacketSendEvent;
+          import cn.nukkit.level.Level;
+          import cn.nukkit.level.format.FullChunk;
+          import cn.nukkit.math.Vector3;
+          import cn.nukkit.network.protocol.AddEntityPacket;
+          import cn.nukkit.network.protocol.AddItemEntityPacket;
+          import cn.nukkit.network.protocol.DataPacket;
+          import cn.nukkit.network.protocol.UpdateBlockPacket;
+          import cn.nukkit.plugin.PluginBase;
+          import cn.nukkit.scheduler.Task;
+          import cn.nukkit.utils.Config;
+
+          import java.lang.reflect.Method;
+          import java.util.*;
+          import java.util.concurrent.ConcurrentHashMap;
+          import java.util.concurrent.ConcurrentLinkedQueue;
+
+          public class AntiXray extends PluginBase implements Listener {
+
+              static final byte ORE = 1, OBS = 2, CONT = 3, BASE = 4;
+
+              // настройки
+              int interval = 10, chunksPerCycle = 6, packetsPerCycle = 600, sendDelay = 20, scanChunks = 8, undergroundDepth = 8;
+              double rItems = 20, rMobs = 20, rProj = 20, rPlayers = 50;
+              double[] r2 = new double[5];
+              double maxR2 = 0;
+              Set<String> enabledWorlds = new HashSet<>();
+              List<String> oreKeys = new ArrayList<>(), contKeys = new ArrayList<>(), baseKeys = new ArrayList<>(), obsNames = new ArrayList<>();
+              int deepslateId = 1, netherrackId = 87, endStoneId = 121;
+
+              // кэши
+              final Map<Integer, Byte> catCache = new ConcurrentHashMap<>();
+              final Map<Integer, Integer> rtCache = new ConcurrentHashMap<>();
+              final Map<String, Map<Long, ChunkData>> cache = new ConcurrentHashMap<>();
+              final Map<String, int[]> heights = new ConcurrentHashMap<>();
+              final Map<Integer, int[][]> offsetCache = new ConcurrentHashMap<>();
+              final Map<UUID, PS> states = new ConcurrentHashMap<>();
+              final ThreadLocal<Boolean> ours = ThreadLocal.withInitial(() -> false);
+              volatile long tickNo = 0;
+              int errors = 0;
+
+              static class ChunkData {
+                  int n;
+                  int[] wx, wy, wz, key, fake;
+                  byte[] cat;
+              }
+
+              static class PS {
+                  String level = "";
+                  final Set<Long> hiddenEnt = ConcurrentHashMap.newKeySet();
+                  final Set<UUID> hiddenPl = new HashSet<>();
+                  final Map<Long, HashSet<Integer>> fake = new HashMap<>();
+                  final Set<Long> settled = new HashSet<>();
+                  final Map<Long, Long> seen = new ConcurrentHashMap<>();
+                  final ConcurrentLinkedQueue<Long> resets = new ConcurrentLinkedQueue<>();
+              }
+
+              @Override
+              public void onEnable() {
+                  saveDefaultConfig();
+                  load();
+                  getServer().getPluginManager().registerEvents(this, this);
+                  getServer().getScheduler().scheduleRepeatingTask(new Task() {
+                      @Override
+                      public void onRun(int currentTick) {
+                          cycle();
+                      }
+                  }, interval);
+                  if (rt(1) < 0) {
+                      getLogger().error("AntiXray: не удалось получить runtime id блоков, подмена блоков работать не будет");
+                  } else {
+                      getLogger().info("AntiXray включен");
+                  }
+              }
+
+              void load() {
+                  reloadConfig();
+                  Config c = getConfig();
+                  interval = Math.max(1, c.getInt("interval-ticks", 10));
+                  chunksPerCycle = Math.max(1, c.getInt("chunks-per-cycle", 6));
+                  packetsPerCycle = Math.max(10, c.getInt("packets-per-cycle", 600));
+                  sendDelay = Math.max(0, c.getInt("send-delay-ticks", 20));
+                  scanChunks = Math.max(2, c.getInt("scan-chunks", 8));
+                  undergroundDepth = c.getInt("underground-depth", 8);
+                  double ore = c.getDouble("radius.ore", 15);
+                  double obs = c.getDouble("radius.obsidian", 15);
+                  double base = c.getDouble("radius.base", 20);
+                  double cont = c.getDouble("radius.container", 20);
+                  rItems = c.getDouble("radius.items", 20);
+                  rMobs = c.getDouble("radius.mobs", 20);
+                  rProj = c.getDouble("radius.projectiles", 20);
+                  rPlayers = c.getDouble("radius.players", 50);
+                  r2[ORE] = ore * ore;
+                  r2[OBS] = obs * obs;
+                  r2[BASE] = base * base;
+                  r2[CONT] = cont * cont;
+                  maxR2 = Math.max(Math.max(r2[1], r2[2]), Math.max(r2[3], r2[4]));
+                  enabledWorlds = new HashSet<>(c.getStringList("worlds"));
+                  oreKeys = c.getStringList("ore-keywords");
+                  contKeys = c.getStringList("container-keywords");
+                  baseKeys = c.getStringList("base-keywords");
+                  obsNames = c.getStringList("obsidian-names");
+                  catCache.clear();
+                  rtCache.clear();
+                  cache.clear();
+                  heights.clear();
+                  offsetCache.clear();
+                  deepslateId = 1;
+                  for (int i = 1; i < 1800; i++) {
+                      try {
+                          String n = Block.get(i).getName();
+                          if ("Deepslate".equals(n)) {
+                              deepslateId = i;
+                              break;
+                          }
+                      } catch (Throwable ignored) {
+                      }
+                  }
+              }
+
+              // ---------- категории блоков ----------
+
+              byte category(int id) {
+                  Byte cached = catCache.get(id);
+                  if (cached != null) return cached;
+                  byte cat = 0;
+                  try {
+                      String n = Block.get(id).getName();
+                      if (n != null) {
+                          if (obsNames.contains(n)) cat = OBS;
+                          else if (hasKey(oreKeys, n)) cat = ORE;
+                          else if (hasKey(contKeys, n)) cat = CONT;
+                          else if (hasKey(baseKeys, n)) cat = BASE;
+                      }
+                  } catch (Throwable ignored) {
+                  }
+                  catCache.put(id, cat);
+                  return cat;
+              }
+
+              static boolean hasKey(List<String> keys, String name) {
+                  for (String k : keys) {
+                      if (name.contains(k)) return true;
+                  }
+                  return false;
+              }
+
+              String nameOf(int id) {
+                  try {
+                      String n = Block.get(id).getName();
+                      return n == null ? "" : n;
+                  } catch (Throwable t) {
+                      return "";
+                  }
+              }
+
+              int fakeFor(Level lvl, byte c, int id, int wx, int y, int wz, int hm, int dim) {
+                  int stone = dim == 1 ? netherrackId : (dim == 2 ? endStoneId : 1);
+                  switch (c) {
+                      case ORE:
+                          if (dim == 0 && nameOf(id).startsWith("Deepslate")) return deepslateId;
+                          return stone;
+                      case OBS:
+                          return 0;
+                      case CONT: {
+                          int[][] d = {{0, -1, 0}, {1, 0, 0}, {-1, 0, 0}, {0, 0, 1}, {0, 0, -1}, {0, 1, 0}};
+                          for (int[] o : d) {
+                              int nid = lvl.getBlockIdAt(wx + o[0], y + o[1], wz + o[2]);
+                              if (nid == 0 || category(nid) != 0) continue;
+                              try {
+                                  if (Block.get(nid).isSolid()) return nid;
+                              } catch (Throwable ignored) {
+                              }
+                          }
+                          return stone;
+                      }
+                      default:
+                          return y > hm - undergroundDepth ? 0 : stone;
+                  }
+              }
+
+              // ---------- runtime id и отправка блоков ----------
+
+              int rt(int id) {
+                  Integer c = rtCache.get(id);
+                  if (c != null) return c;
+                  int v = computeRt(id);
+                  rtCache.put(id, v);
+                  return v;
+              }
+
+              int computeRt(int id) {
+                  try {
+                      Block b = Block.get(id, 0);
+                      Method m = b.getClass().getMethod("getRuntimeId");
+                      return ((Number) m.invoke(b)).intValue();
+                  } catch (Throwable ignored) {
+                  }
+                  try {
+                      Class<?> cl = Class.forName("cn.nukkit.level.GlobalBlockPalette");
+                      Method m = cl.getMethod("getOrCreateRuntimeId", int.class, int.class);
+                      return ((Number) m.invoke(null, id, 0)).intValue();
+                  } catch (Throwable ignored) {
+                  }
+                  try {
+                      Class<?> cl = Class.forName("cn.nukkit.level.GlobalBlockPalette");
+                      Method m = cl.getMethod("getRuntimeId", int.class, int.class);
+                      return ((Number) m.invoke(null, id, 0)).intValue();
+                  } catch (Throwable ignored) {
+                  }
+                  return -1;
+              }
+
+              boolean sendFake(Player p, int x, int y, int z, int id) {
+                  int r = rt(id);
+                  if (r < 0) return false;
+                  UpdateBlockPacket pk = new UpdateBlockPacket();
+                  pk.x = x;
+                  pk.y = y;
+                  pk.z = z;
+                  pk.blockRuntimeId = r;
+                  pk.flags = UpdateBlockPacket.FLAG_ALL_PRIORITY;
+                  ours.set(true);
+                  try {
+                      p.dataPacket(pk);
+                  } finally {
+                      ours.set(false);
+                  }
+                  return true;
+              }
+
+              // ---------- сканирование чанка ----------
+
+              int[] heightsOf(Level lvl, FullChunk ch) {
+                  int[] h = heights.get(lvl.getName());
+                  if (h != null) return h;
+                  int minY, maxY;
+                  try {
+                      Method m = lvl.getClass().getMethod("getMinHeight");
+                      minY = ((Number) m.invoke(lvl)).intValue();
+                  } catch (Throwable t) {
+                      try {
+                          ch.getBlockId(0, -64, 0);
+                          minY = -64;
+                      } catch (Throwable t2) {
+                          minY = 0;
+                      }
+                  }
+                  try {
+                      Method m = lvl.getClass().getMethod("getMaxHeight");
+                      maxY = ((Number) m.invoke(lvl)).intValue();
+                  } catch (Throwable t) {
+                      try {
+                          ch.getBlockId(0, 319, 0);
+                          maxY = 320;
+                      } catch (Throwable t2) {
+                          maxY = 256;
+                      }
+                  }
+                  h = new int[]{minY, maxY};
+                  heights.put(lvl.getName(), h);
+                  return h;
+              }
+
+              ChunkData build(Level lvl, int cx, int cz) {
+                  FullChunk ch = lvl.getChunk(cx, cz, false);
+                  if (ch == null) return null;
+                  int[] hh = heightsOf(lvl, ch);
+                  int dim = lvl.getDimension();
+                  ArrayList<int[]> rows = new ArrayList<>();
+                  for (int x = 0; x < 16; x++) {
+                      for (int z = 0; z < 16; z++) {
+                          int hm = 0;
+                          try {
+                              hm = ch.getHeightMap(x, z);
+                          } catch (Throwable ignored) {
+                          }
+                          for (int y = hh[0]; y < hh[1]; y++) {
+                              int id;
+                              try {
+                                  id = ch.getBlockId(x, y, z);
+                              } catch (Throwable t) {
+                                  continue;
+                              }
+                              if (id == 0) continue;
+                              byte c = category(id);
+                              if (c == 0) continue;
+                              int wx = (cx << 4) + x, wz = (cz << 4) + z;
+                              int fk = fakeFor(lvl, c, id, wx, y, wz, hm, dim);
+                              rows.add(new int[]{wx, y, wz, c, fk, ((y + 256) << 8) | (x << 4) | z});
+                          }
+                      }
+                  }
+                  ChunkData cd = new ChunkData();
+                  cd.n = rows.size();
+                  cd.wx = new int[cd.n];
+                  cd.wy = new int[cd.n];
+                  cd.wz = new int[cd.n];
+                  cd.cat = new byte[cd.n];
+                  cd.fake = new int[cd.n];
+                  cd.key = new int[cd.n];
+                  for (int i = 0; i < cd.n; i++) {
+                      int[] r = rows.get(i);
+                      cd.wx[i] = r[0];
+                      cd.wy[i] = r[1];
+                      cd.wz[i] = r[2];
+                      cd.cat[i] = (byte) r[3];
+                      cd.fake[i] = r[4];
+                      cd.key[i] = r[5];
+                  }
+                  return cd;
+              }
+
+              // ---------- утилиты ----------
+
+              static long key(int cx, int cz) {
+                  return ((long) cx << 32) | (cz & 0xffffffffL);
+              }
+
+              static int cxOf(long k) {
+                  return (int) (k >> 32);
+              }
+
+              static int czOf(long k) {
+                  return (int) k;
+              }
+
+              static double chunkDist2(int cx, int cz, double px, double pz) {
+                  double minx = cx * 16.0, maxx = minx + 16, minz = cz * 16.0, maxz = minz + 16;
+                  double dx = px < minx ? minx - px : (px > maxx ? px - maxx : 0);
+                  double dz = pz < minz ? minz - pz : (pz > maxz ? pz - maxz : 0);
+                  return dx * dx + dz * dz;
+              }
+
+              int[][] offsetsFor(int rad) {
+                  return offsetCache.computeIfAbsent(rad, r -> {
+                      List<int[]> l = new ArrayList<>();
+                      for (int dx = -r; dx <= r; dx++) {
+                          for (int dz = -r; dz <= r; dz++) l.add(new int[]{dx, dz});
+                      }
+                      l.sort(Comparator.comparingInt(a -> a[0] * a[0] + a[1] * a[1]));
+                      return l.toArray(new int[0][]);
+                  });
+              }
+
+              double entRadius(Entity e) {
+                  if (e instanceof Player) return -1;
+                  if (e instanceof EntityItem || e instanceof EntityXPOrb) return rItems;
+                  if (e instanceof EntityProjectile) return rProj;
+                  if (e instanceof EntityLiving) return rMobs;
+                  return -1;
+              }
+
+              // ---------- основной цикл ----------
+
+              void cycle() {
+                  tickNo += interval;
+                  for (Player p : new ArrayList<>(getServer().getOnlinePlayers().values())) {
+                      try {
+                          handle(p);
+                      } catch (Throwable t) {
+                          if (errors++ < 5) getLogger().error("AntiXray ошибка: " + t, t);
+                      }
+                  }
+              }
+
+              void handle(Player p) {
+                  if (!p.isOnline() || !p.spawned || p.getLevel() == null) return;
+                  Level lvl = p.getLevel();
+                  if (!enabledWorlds.isEmpty() && !enabledWorlds.contains(lvl.getName())) return;
+                  PS ps = states.computeIfAbsent(p.getUniqueId(), k -> new PS());
+                  if (!lvl.getName().equals(ps.level)) {
+                      ps.level = lvl.getName();
+                      ps.fake.clear();
+                      ps.settled.clear();
+                      ps.seen.clear();
+                      ps.hiddenEnt.clear();
+                  }
+                  Long rk;
+                  while ((rk = ps.resets.poll()) != null) {
+                      ps.fake.remove(rk);
+                      ps.settled.remove(rk);
+                  }
+                  boolean bypass = p.hasPermission("antixray.bypass");
+                  double px = p.x, py = p.y, pz = p.z;
+
+                  // --- существа и игроки ---
+                  ps.hiddenEnt.removeIf(id -> lvl.getEntity(id) == null);
+                  for (Entity e : lvl.getEntities()) {
+                      if (e == p || e.closed) continue;
+                      if (e instanceof Player) {
+                          handlePlayer(p, (Player) e, ps, bypass, px, py, pz);
+                          continue;
+                      }
+                      double rr = entRadius(e);
+                      if (rr < 0) continue;
+                      if (bypass) rr = 1e6;
+                      double dx = e.x - px, dy = e.y - py, dz = e.z - pz;
+                      boolean far = dx * dx + dy * dy + dz * dz > rr * rr;
+                      long id = e.getId();
+                      boolean hid = ps.hiddenEnt.contains(id);
+                      if (far && !hid) {
+                          ps.hiddenEnt.add(id);
+                          e.despawnFrom(p);
+                      } else if (!far && hid) {
+                          ps.hiddenEnt.remove(id);
+                          e.spawnTo(p);
+                      }
+                  }
+
+                  // --- блоки ---
+                  int pcx = p.getFloorX() >> 4, pcz = p.getFloorZ() >> 4;
+                  int rad = Math.min(scanChunks, Math.max(2, getServer().getViewDistance()));
+                  final int fr = rad + 2;
+                  ps.fake.keySet().removeIf(k -> Math.abs(cxOf(k) - pcx) > fr || Math.abs(czOf(k) - pcz) > fr);
+                  ps.settled.removeIf(k -> Math.abs(cxOf(k) - pcx) > fr || Math.abs(czOf(k) - pcz) > fr);
+                  ps.seen.keySet().removeIf(k -> Math.abs(cxOf(k) - pcx) > fr || Math.abs(czOf(k) - pcz) > fr);
+
+                  double[] R2 = r2;
+                  double mx2 = maxR2;
+                  if (bypass) {
+                      R2 = new double[]{1e24, 1e24, 1e24, 1e24, 1e24};
+                      mx2 = 1e24;
+                  }
+                  int budget = packetsPerCycle, cbudget = chunksPerCycle;
+                  List<Vector3> real = new ArrayList<>();
+                  Map<Long, ChunkData> lc = cache.computeIfAbsent(lvl.getName(), k -> new ConcurrentHashMap<>());
+
+                  for (int[] o : offsetsFor(rad)) {
+                      if (budget <= 0) break;
+                      int cx = pcx + o[0], cz = pcz + o[1];
+                      long k = key(cx, cz);
+                      double cd2 = chunkDist2(cx, cz, px, pz);
+                      if (ps.settled.contains(k)) {
+                          if (cd2 > mx2) continue;
+                          ps.settled.remove(k);
+                      }
+                      Long st = ps.seen.get(k);
+                      if (st != null && tickNo - st < sendDelay) continue;
+                      if (!lvl.isChunkLoaded(cx, cz)) continue;
+                      ChunkData cd = lc.get(k);
+                      if (cd == null) {
+                          if (cbudget <= 0) continue;
+                          cbudget--;
+                          cd = build(lvl, cx, cz);
+                          if (cd == null) continue;
+                          lc.put(k, cd);
+                      }
+                      HashSet<Integer> fs = ps.fake.computeIfAbsent(k, kk -> new HashSet<>());
+                      boolean pending = false;
+                      for (int i = 0; i < cd.n; i++) {
+                          double dx = cd.wx[i] + 0.5 - px, dy = cd.wy[i] + 0.5 - py, dz = cd.wz[i] + 0.5 - pz;
+                          boolean want = dx * dx + dy * dy + dz * dz > R2[cd.cat[i]];
+                          boolean is = fs.contains(cd.key[i]);
+                          if (want == is) continue;
+                          if (budget <= 0) {
+                              pending = true;
+                              break;
+                          }
+                          if (want) {
+                              if (sendFake(p, cd.wx[i], cd.wy[i], cd.wz[i], cd.fake[i])) {
+                                  fs.add(cd.key[i]);
+                                  budget--;
+                              }
+                          } else {
+                              real.add(new Vector3(cd.wx[i], cd.wy[i], cd.wz[i]));
+                              fs.remove(cd.key[i]);
+                              budget--;
+                          }
+                      }
+                      if (!pending && cd2 > mx2) ps.settled.add(k);
+                  }
+                  if (!real.isEmpty()) {
+                      lvl.sendBlocks(new Player[]{p}, real.toArray(new Vector3[0]));
+                  }
+              }
+
+              void handlePlayer(Player v, Player o, PS ps, boolean bypass, double px, double py, double pz) {
+                  if (o.getLevel() != v.getLevel()) return;
+                  boolean hide = false;
+                  if (!bypass) {
+                      if (o.isSpectator() && !v.hasPermission("antixray.seespec")) {
+                          hide = true;
+                      } else {
+                          double dx = o.x - px, dy = o.y - py, dz = o.z - pz;
+                          if (dx * dx + dy * dy + dz * dz > rPlayers * rPlayers) hide = true;
+                      }
+                  }
+                  UUID id = o.getUniqueId();
+                  boolean mine = ps.hiddenPl.contains(id);
+                  if (hide && !mine && v.canSee(o)) {
+                      v.hidePlayer(o);
+                      ps.hiddenPl.add(id);
+                  } else if (!hide && mine) {
+                      ps.hiddenPl.remove(id);
+                      v.showPlayer(o);
+                  }
+              }
+
+              // ---------- события ----------
+
+              @EventHandler(priority = EventPriority.HIGHEST)
+              public void onSend(DataPacketSendEvent ev) {
+                  try {
+                      Player p = ev.getPlayer();
+                      DataPacket pk = ev.getPacket();
+                      if (pk == null || p == null) return;
+                      long eid = -1;
+                      if (pk instanceof AddEntityPacket) eid = ((AddEntityPacket) pk).entityRuntimeId;
+                      else if (pk instanceof AddItemEntityPacket) eid = ((AddItemEntityPacket) pk).entityRuntimeId;
+                      if (eid >= 0) {
+                          PS ps = states.get(p.getUniqueId());
+                          Level lvl = p.getLevel();
+                          if (ps == null || lvl == null || p.hasPermission("antixray.bypass")) return;
+                          if (ps.hiddenEnt.contains(eid)) {
+                              ev.setCancelled();
+                              return;
+                          }
+                          Entity e = lvl.getEntity(eid);
+                          if (e == null) return;
+                          double rr = entRadius(e);
+                          if (rr < 0) return;
+                          double dx = e.x - p.x, dy = e.y - p.y, dz = e.z - p.z;
+                          if (dx * dx + dy * dy + dz * dz > rr * rr) {
+                              ps.hiddenEnt.add(eid);
+                              ev.setCancelled();
+                          }
+                          return;
+                      }
+                      String n = pk.getClass().getSimpleName();
+                      if (n.equals("LevelChunkPacket") || n.equals("FullChunkDataPacket")) {
+                          PS ps = states.get(p.getUniqueId());
+                          if (ps == null) return;
+                          int cx = pk.getClass().getField("chunkX").getInt(pk);
+                          int cz = pk.getClass().getField("chunkZ").getInt(pk);
+                          long k = key(cx, cz);
+                          ps.seen.put(k, tickNo);
+                          ps.resets.add(k);
+                      }
+                  } catch (Throwable ignored) {
+                  }
+              }
+
+              void dirty(Level lvl, int x, int z) {
+                  if (lvl == null) return;
+                  Map<Long, ChunkData> lc = cache.get(lvl.getName());
+                  long k = key(x >> 4, z >> 4);
+                  if (lc != null) lc.remove(k);
+                  for (PS ps : states.values()) ps.settled.remove(k);
+              }
+
+              @EventHandler(priority = EventPriority.MONITOR)
+              public void onBreak(BlockBreakEvent ev) {
+                  Block b = ev.getBlock();
+                  dirty(b.getLevel(), b.getFloorX(), b.getFloorZ());
+              }
+
+              @EventHandler(priority = EventPriority.MONITOR)
+              public void onPlace(BlockPlaceEvent ev) {
+                  Block b = ev.getBlock();
+                  dirty(b.getLevel(), b.getFloorX(), b.getFloorZ());
+              }
+
+              @EventHandler
+              public void onUnload(ChunkUnloadEvent ev) {
+                  Map<Long, ChunkData> lc = cache.get(ev.getLevel().getName());
+                  if (lc != null) lc.remove(key(ev.getChunk().getX(), ev.getChunk().getZ()));
+              }
+
+              @EventHandler
+              public void onQuit(PlayerQuitEvent ev) {
+                  states.remove(ev.getPlayer().getUniqueId());
+              }
+
+              @Override
+              public boolean onCommand(CommandSender s, Command cmd, String label, String[] args) {
+                  if (!cmd.getName().equalsIgnoreCase("axr")) return false;
+                  if (args.length == 0) {
+                      s.sendMessage("§e/axr reload§7 - перезагрузить config.yml, §e/axr info§7 - состояние");
+                      return true;
+                  }
+                  if (args[0].equalsIgnoreCase("reload")) {
+                      load();
+                      for (PS ps : states.values()) {
+                          ps.fake.clear();
+                          ps.settled.clear();
+                      }
+                      s.sendMessage("§aAntiXray: config.yml перезагружен");
+                      return true;
+                  }
+                  if (args[0].equalsIgnoreCase("info")) {
+                      int chunks = 0;
+                      for (Map<Long, ChunkData> m : cache.values()) chunks += m.size();
+                      s.sendMessage("§eAntiXray: §7чанков в кэше: §f" + chunks + "§7, игроков: §f" + states.size());
+                      return true;
+                  }
+                  return false;
+              }
+          }
+          JAVAEOF
+
+      - name: Build
+        run: |
+          cd AntiXray
+          mvn -B clean package
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AntiXray-jar
+          path: AntiXray/target/AntiXray.jar
